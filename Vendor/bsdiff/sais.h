@@ -33,7 +33,7 @@ extern "C" {
 
 #include <sys/types.h>
 
-#define sais_index_type off_t
+#define sais_index_type int
 
 /* find the suffix array SA of T[0..n-1]
    use a working space (excluding T and SA) of at most 2n+O(lg n) */

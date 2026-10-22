@@ -11,6 +11,12 @@
 #import <CommonCrypto/CommonDigest.h>
 #import "SUBinaryDeltaCommon.h"
 #import <compression.h>
+#ifdef SPARKLE_XZ_ENCODER
+#include <lzma.h>
+// libcompression's LZMA encoder has no settings and is several times slower. Its decoder reads this output.
+#define SPARKLE_XZ_PRESET 3
+#define SPARKLE_XZ_DICTIONARY_SIZE (8u << 20)
+#endif
 
 #if SPARKLE_BUILD_BZIP2_DELTA_SUPPORT
 #import <bzlib.h>
@@ -47,6 +53,10 @@ typedef struct
     SPUDeltaCompressionMode _compression;
     
     BOOL _initializedCompressionStream;
+#ifdef SPARKLE_XZ_ENCODER
+    lzma_stream _xz;
+    BOOL _useXz;
+#endif
     BOOL _writeMode;
 }
 
@@ -720,6 +730,26 @@ static compression_algorithm compressionAlgorithmForMode(SPUDeltaCompressionMode
         case SPUDeltaCompressionModeLZFSE:
         case SPUDeltaCompressionModeLZ4:
         case SPUDeltaCompressionModeZLIB: {
+#ifdef SPARKLE_XZ_ENCODER
+            if (_useXz) {
+                _xz.next_in = (const uint8_t *)buffer;
+                _xz.avail_in = (size_t)length;
+                while (_xz.avail_in > 0) {
+                    _xz.next_out = (uint8_t *)_compressionBuffer;
+                    _xz.avail_out = COMPRESSION_BUFFER_SIZE;
+                    if (lzma_code(&_xz, LZMA_RUN) != LZMA_OK) {
+                        _error = [NSError errorWithDomain:SPARKLE_COMPRESSION_ERROR_DOMAIN code:COMPRESSION_STATUS_ERROR userInfo:@{ NSLocalizedDescriptionKey: @"Failed to write compressed bytes with xz" }];
+                        return NO;
+                    }
+                    size_t produced = COMPRESSION_BUFFER_SIZE - _xz.avail_out;
+                    if (produced > 0 && fwrite(_compressionBuffer, produced, 1, _file) < 1) {
+                        _error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{ NSLocalizedDescriptionKey: @"Failed to write xz compressed bytes to archive" }];
+                        return NO;
+                    }
+                }
+                return YES;
+            }
+#endif
             _compressionStream.src_ptr = (const uint8_t *)buffer;
             _compressionStream.src_size = (size_t)length;
             
@@ -856,6 +886,21 @@ static compression_algorithm compressionAlgorithmForMode(SPUDeltaCompressionMode
             }
             
             _initializedCompressionStream = YES;
+#ifdef SPARKLE_XZ_ENCODER
+            if (compression == SPUDeltaCompressionModeLZMA) {
+                lzma_options_lzma options;
+                lzma_lzma_preset(&options, SPARKLE_XZ_PRESET);
+                options.dict_size = SPARKLE_XZ_DICTIONARY_SIZE;
+                lzma_filter filters[] = { { LZMA_FILTER_LZMA2, &options }, { LZMA_VLI_UNKNOWN, NULL } };
+                lzma_stream initial = LZMA_STREAM_INIT;
+                _xz = initial;
+                if (lzma_stream_encoder(&_xz, filters, LZMA_CHECK_CRC64) != LZMA_OK) {
+                    _error = [NSError errorWithDomain:SPARKLE_COMPRESSION_ERROR_DOMAIN code:COMPRESSION_STATUS_ERROR userInfo:@{ NSLocalizedDescriptionKey: @"Failed to open xz stream" }];
+                    return;
+                }
+                _useXz = YES;
+            }
+#endif
             break;
         }
     }
@@ -1255,6 +1300,24 @@ static compression_algorithm compressionAlgorithmForMode(SPUDeltaCompressionMode
             _error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{ NSLocalizedDescriptionKey: @"Failed to write and close bzip2 file due to IO error" }];
             return;
         }
+    } else
+#endif
+#ifdef SPARKLE_XZ_ENCODER
+    if (_useXz) {
+        lzma_ret ret;
+        _xz.avail_in = 0;
+        do {
+            _xz.next_out = (uint8_t *)_compressionBuffer;
+            _xz.avail_out = COMPRESSION_BUFFER_SIZE;
+            ret = lzma_code(&_xz, LZMA_FINISH);
+            size_t produced = COMPRESSION_BUFFER_SIZE - _xz.avail_out;
+            if ((ret != LZMA_OK && ret != LZMA_STREAM_END) || (produced > 0 && fwrite(_compressionBuffer, produced, 1, _file) < 1)) {
+                _error = [NSError errorWithDomain:SPARKLE_COMPRESSION_ERROR_DOMAIN code:COMPRESSION_STATUS_ERROR userInfo:@{ NSLocalizedDescriptionKey: @"Failed to write final bits of xz file" }];
+                return;
+            }
+        } while (ret != LZMA_STREAM_END);
+        lzma_end(&_xz);
+        _useXz = NO;
     } else
 #endif
     if (_initializedCompressionStream) {

@@ -39,6 +39,129 @@ __FBSDID("$FreeBSD: src/usr.bin/bsdiff/bsdiff/bsdiff.c, v 1.1 2005/08/06 01:59:0
 #include <unistd.h>
 
 #include "bscommon.h"
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+/* Files at least this big use a sampled hash index instead of a suffix array:
+ * no sort, a fraction of the memory, and one probe per position instead of a
+ * binary search. Patches stay valid but can be slightly larger. */
+#define HASH_INDEX_MIN_SIZE (1 << 20)
+#define HASH_STRIDE 2
+#define HASH_WAYS 8
+#define HASH_KEY_MASK 0xFFFFFFFFFFFFull /* 6 bytes */
+#define HASH_READ_SIZE 8
+
+typedef struct {
+    uint32_t *slots;
+    uint64_t buckets;
+} hash_index;
+
+/* Big buffers skip malloc, which keeps freed large blocks resident in its cache. */
+static void *big_alloc(size_t size)
+{
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+static void big_free(void *p, size_t size)
+{
+    if (p != NULL)
+        munmap(p, size);
+}
+
+/* An empty file gets a one-byte anonymous mapping, so callers can always unmap. */
+static u_char *map_file(const char *path, off_t *size)
+{
+    struct stat st;
+    void *p;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    *size = st.st_size;
+    if (st.st_size == 0) {
+        close(fd);
+        return big_alloc(1);
+    }
+    p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+static void unmap_file(u_char *p, off_t size)
+{
+    big_free(p, size ? (size_t)size : 1);
+}
+
+static inline uint64_t hash_key(const u_char *p)
+{
+    uint64_t v;
+    memcpy(&v, p, HASH_READ_SIZE);
+    return v & HASH_KEY_MASK;
+}
+
+static inline uint32_t *hash_bucket(const hash_index *h, uint64_t key)
+{
+    uint64_t mixed = key * 0x9E3779B97F4A7C15ull;
+    return h->slots + (uint64_t)(((__uint128_t)mixed * h->buckets) >> 64) * HASH_WAYS;
+}
+
+static size_t hash_bytes(const hash_index *h)
+{
+    return (size_t)h->buckets * HASH_WAYS * sizeof(uint32_t);
+}
+
+static int hash_build(hash_index *h, const u_char *old, off_t oldsize)
+{
+    h->buckets = (uint64_t)(oldsize / HASH_STRIDE + 1) / HASH_WAYS + 1;
+    if ((h->slots = big_alloc(hash_bytes(h))) == NULL)
+        return -1;
+
+    for (off_t i = 0; i + HASH_READ_SIZE <= oldsize; i += HASH_STRIDE) {
+        uint32_t *bucket = hash_bucket(h, hash_key(old + i));
+        memmove(bucket + 1, bucket, (HASH_WAYS - 1) * sizeof(uint32_t));
+        bucket[0] = (uint32_t)i + 1;
+    }
+    return 0;
+}
+
+static off_t matchlen(u_char *old, off_t oldsize, u_char *newp, off_t newsize);
+
+/* Longest match among the bucket's candidates, preferring the one closest to
+ * 'expected' on ties. Returns 0 if there is none. */
+static off_t hash_search(const hash_index *h, u_char *old, off_t oldsize,
+        u_char *newp, off_t newsize, off_t expected, off_t *pos)
+{
+    off_t best = 0, bestdistance = 0;
+    uint64_t key;
+    const uint32_t *bucket;
+
+    if (newsize < HASH_READ_SIZE)
+        return 0;
+
+    key = hash_key(newp);
+    bucket = hash_bucket(h, key);
+    for (unsigned w = 0; w < HASH_WAYS && bucket[w] != 0; w++) {
+        off_t candidate = (off_t)bucket[w] - 1;
+        off_t length, distance;
+
+        if (hash_key(old + candidate) != key)
+            continue;
+        length = matchlen(old + candidate, oldsize - candidate, newp, newsize);
+        distance = (candidate > expected) ? candidate - expected : expected - candidate;
+        if (length > best || (length == best && distance < bestdistance)) {
+            best = length;
+            bestdistance = distance;
+            *pos = candidate;
+        }
+    }
+    return best;
+}
 
 #define MIN(x, y) (((x)<(y)) ? (x) : (y))
 
@@ -65,7 +188,7 @@ static off_t matchlen(u_char *old, off_t oldsize, u_char *newp, off_t newsize)
  * 'old', and 'st' and 'en' are the lowest and highest indices in the suffix
  * sort to consider. If you're searching all suffixes, 'st = 0' and 'en =
  * oldsize - 1'. */
-static off_t search(off_t *I, u_char *old, off_t oldsize,
+static off_t search(int *I, u_char *old, off_t oldsize,
         u_char *newp, off_t newsize, off_t st, off_t en, off_t *pos)
 {
     off_t x, y;
@@ -125,7 +248,11 @@ int bsdiff(int argc, char *argv[])
 {
     u_char *old = NULL,*newp = NULL;           /* contents of old, new files */
     off_t oldsize = 0, newsize = 0;     /* length of old, new files */
-    off_t *I = NULL,*V = NULL;                /* arrays used for suffix sort; I is ordering */
+    int *I = NULL;                  /* suffix sort of old, for small files; I is ordering */
+    size_t Ibytes = 0;              /* size of I */
+    hash_index H = {0};             /* sampled index of old, for large files */
+    int usehash = 0;
+    off_t mappednewsize = 0;        /* newsize is reused as scratch below */
     off_t scan = 0;                 /* position of current match in old file */
     off_t pos = 0;              /* position of current match in new file */
     off_t len = 0;                  /* length of current match */
@@ -148,33 +275,39 @@ int bsdiff(int argc, char *argv[])
         goto cleanup;
     }
 
-    old = readfile(argv[1], &oldsize);
+    old = map_file(argv[1], &oldsize);
     if (old == NULL) {
         warn("old file error: %s", argv[1]);
         goto cleanup;
     }
 
-    if (((I = (off_t *)malloc(((size_t)oldsize + 1) * sizeof(off_t))) == NULL) ||
-        ((V = (off_t *)malloc(((size_t)oldsize + 1) * sizeof(off_t))) == NULL)) {
-        warn("Failed to allocate memory for I or V");
-        goto cleanup;
+    usehash = oldsize >= HASH_INDEX_MIN_SIZE;
+    if (usehash) {
+        if (hash_build(&H, old, oldsize) != 0) {
+            warn("Failed to allocate memory for hash index");
+            goto cleanup;
+        }
+    } else {
+        Ibytes = ((size_t)oldsize + 1) * sizeof(int);
+        if ((I = big_alloc(Ibytes)) == NULL) {
+            warn("Failed to allocate memory for I");
+            goto cleanup;
+        }
+
+        /* Do a suffix sort on the old file. */
+        I[0] = (int)oldsize;
+        sais(old, I+1, (int)oldsize);
     }
 
-    /* Do a suffix sort on the old file. */
-    I[0] = oldsize;
-    sais(old, I+1, (int)oldsize);
-
-    free(V);
-    V = NULL;
-    
-    newp = readfile(argv[2], &newsize);
+    newp = map_file(argv[2], &newsize);
+    mappednewsize = newsize;
     if (newp == NULL) {
         warn("new file error: %s", argv[2]);
         goto cleanup;
     }
 
-    if (((db = (u_char *)malloc((size_t)newsize + 1)) == NULL) ||
-        ((eb = (u_char *)malloc((size_t)newsize + 1)) == NULL)) {
+    if (((db = big_alloc((size_t)newsize + 1)) == NULL) ||
+        ((eb = big_alloc((size_t)newsize + 1)) == NULL)) {
         warn("Failed to allocate memory for db or eb");
         goto cleanup;
     }
@@ -229,8 +362,13 @@ int bsdiff(int argc, char *argv[])
             /* 'oldscore' is the number of characters that match between the
              * substrings 'old[lastoffset + scan:lastoffset + scsc]' and
              * 'new[scan:scsc]'. */
-            len = search(I, old, oldsize, newp + scan, newsize - scan,
-                    0, oldsize, &pos);
+            if (usehash) {
+                len = hash_search(&H, old, oldsize, newp + scan, newsize - scan,
+                        lastoffset + scan, &pos);
+            } else {
+                len = search(I, old, oldsize, newp + scan, newsize - scan,
+                        0, oldsize, &pos);
+            }
 
             /* If this match extends further than the last one, add any new
              * matching characters to 'oldscore'. */
@@ -420,12 +558,15 @@ cleanup:
     }
     
     /* Free the memory we used */
-    free(db);
-    free(eb);
-    free(I);
-    free(V);
-    free(old);
-    free(newp);
+    big_free(db, (size_t)mappednewsize + 1);
+    big_free(eb, (size_t)mappednewsize + 1);
+    big_free(I, Ibytes);
+    if (H.slots != NULL)
+        big_free(H.slots, hash_bytes(&H));
+    if (old != NULL)
+        unmap_file(old, oldsize);
+    if (newp != NULL)
+        unmap_file(newp, mappednewsize);
 
     return exitstatus;
 }
