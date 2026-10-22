@@ -13,7 +13,8 @@
 #import <compression.h>
 #ifdef SPARKLE_XZ_ENCODER
 #include <lzma.h>
-// libcompression's LZMA encoder has no settings and is several times slower. Its decoder reads this output.
+// libcompression's LZMA encoder has no settings and is several times slower.
+// Its decoder reads this output. Streams match its own in having no integrity check, which the tree hash covers.
 #define SPARKLE_XZ_PRESET 3
 #define SPARKLE_XZ_DICTIONARY_SIZE (8u << 20)
 #endif
@@ -94,6 +95,12 @@ typedef struct
 
 - (void)close
 {
+#ifdef SPARKLE_XZ_ENCODER
+    if (_useXz) {
+        lzma_end(&_xz);
+        _useXz = NO;
+    }
+#endif
 #if SPARKLE_BUILD_BZIP2_DELTA_SUPPORT
     if (_bzipFile != NULL) {
         if (!_writeMode) {
@@ -894,7 +901,7 @@ static compression_algorithm compressionAlgorithmForMode(SPUDeltaCompressionMode
                 lzma_filter filters[] = { { LZMA_FILTER_LZMA2, &options }, { LZMA_VLI_UNKNOWN, NULL } };
                 lzma_stream initial = LZMA_STREAM_INIT;
                 _xz = initial;
-                if (lzma_stream_encoder(&_xz, filters, LZMA_CHECK_CRC64) != LZMA_OK) {
+                if (lzma_stream_encoder(&_xz, filters, LZMA_CHECK_NONE) != LZMA_OK) {
                     _error = [NSError errorWithDomain:SPARKLE_COMPRESSION_ERROR_DOMAIN code:COMPRESSION_STATUS_ERROR userInfo:@{ NSLocalizedDescriptionKey: @"Failed to open xz stream" }];
                     return;
                 }

@@ -2345,4 +2345,219 @@ typedef void (^SUDeltaHandler)(NSFileManager *fileManager, NSString *sourceDirec
     XCTAssertTrue(success);
 }
 
+static NSData *deterministicData(NSUInteger length, uint64_t seed)
+{
+    NSMutableData *data = [NSMutableData dataWithLength:length];
+    uint8_t *bytes = data.mutableBytes;
+    uint64_t state = seed;
+    for (NSUInteger i = 0; i < length; i++) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        bytes[i] = (uint8_t)(state >> 56);
+    }
+    return data;
+}
+
+// Which blocks trigger bsdiff's slow paths depends on their bytes, and this one does
+static NSData *repeatingData(NSUInteger length, NSUInteger period)
+{
+    const uint8_t block[] = { 0x45, 0x7C, 0x76, 0x9F, 0x39, 0xD8, 0x64, 0x41 };
+    NSMutableData *data = [NSMutableData dataWithLength:length];
+    uint8_t *bytes = data.mutableBytes;
+    for (NSUInteger i = 0; i < length; i++) {
+        bytes[i] = block[i % period];
+    }
+    return data;
+}
+
+static NSData *dataWithEdits(NSData *original, NSUInteger step)
+{
+    NSMutableData *data = [original mutableCopy];
+    uint8_t *bytes = data.mutableBytes;
+    for (NSUInteger i = step; i < data.length; i += step) {
+        bytes[i] ^= 1;
+    }
+    return data;
+}
+
+// Round trips a delta and returns its size, because a file shipped whole also applies correctly
+- (uint64_t)deltaSizeWithHandler:(SUDeltaHandler)handler
+{
+    NSString *sourceDirectory = temporaryDirectory(@"Sparkle_size1");
+    NSString *destinationDirectory = temporaryDirectory(@"Sparkle_size2");
+    NSString *patchDirectory = temporaryDirectory(@"Sparkle_size3");
+    NSString *diffFile = temporaryFilename(@"Sparkle_sizediff");
+    NSFileManager *fileManager = [[NSFileManager alloc] init];
+
+    handler(fileManager, sourceDirectory, destinationDirectory);
+
+    NSError *error = nil;
+    XCTAssertTrue(createBinaryDelta(sourceDirectory, destinationDirectory, diffFile, SUBinaryDeltaMajorVersionLatest, SPUDeltaCompressionModeLZMA, 0, NO, &error), @"%@", error);
+    uint64_t size = [[fileManager attributesOfItemAtPath:diffFile error:nil] fileSize];
+    XCTAssertTrue(applyBinaryDelta(sourceDirectory, patchDirectory, diffFile, NO, ^(__unused double progress){}, &error), @"%@", error);
+    XCTAssertTrue([self testDirectoryHashEqualityWithSource:destinationDirectory destination:patchDirectory]);
+
+    XCTAssertTrue([fileManager removeItemAtPath:sourceDirectory error:nil]);
+    XCTAssertTrue([fileManager removeItemAtPath:destinationDirectory error:nil]);
+    XCTAssertTrue([fileManager removeItemAtPath:patchDirectory error:nil]);
+    XCTAssertTrue([fileManager removeItemAtPath:diffFile error:nil]);
+    return size;
+}
+
+- (void)writeData:(NSData *)data toPath:(NSString *)relativePath inDirectory:(NSString *)directory
+{
+    NSString *path = [directory stringByAppendingPathComponent:relativePath];
+    XCTAssertTrue([[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil]);
+    XCTAssertTrue([data writeToFile:path atomically:NO]);
+}
+
+- (void)testHashedRenameIsDiffed
+{
+    NSData *original = deterministicData(65536, 1);
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"assets/chunk-AAAAAAAA.js" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(original, 4096) toPath:@"assets/chunk-BBBBBBBB.js" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(size, 8192u);
+}
+
+- (void)testSmallHashedRenameIsDiffed
+{
+    NSData *original = deterministicData(8192, 12);
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"assets/chunk-AAAAAAAA.js" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(original, 4096) toPath:@"assets/chunk-BBBBBBBB.js" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(size, 4096u);
+}
+
+- (void)testSimilarRenameIsDiffed
+{
+    NSData *original = deterministicData(65536, 2);
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"one/first.bin" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(original, 4096) toPath:@"two/second.bin" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(size, 8192u);
+}
+
+- (void)testAmbiguousHashedStemsMatchByContent
+{
+    NSData *first = deterministicData(65536, 3);
+    NSData *second = deterministicData(65536, 4);
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:first toPath:@"assets/index-AAAAAAAA.js" inDirectory:sourceDirectory];
+        [self writeData:second toPath:@"assets/index-BBBBBBBB.js" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(second, 4096) toPath:@"assets/index-CCCCCCCC.js" inDirectory:destinationDirectory];
+        [self writeData:dataWithEdits(first, 4096) toPath:@"assets/index-DDDDDDDD.js" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(size, 16384u);
+}
+
+- (void)testSmallSimilarRenameIsNotDiffed
+{
+    NSData *original = deterministicData(8192, 5);
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"one/first.bin" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(original, 4096) toPath:@"two/second.bin" inDirectory:destinationDirectory];
+    }];
+    XCTAssertGreaterThan(size, 8192u);
+}
+
+- (void)testDirectoryReplacedBySimilarFile
+{
+    NSData *original = deterministicData(65536, 6);
+    [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"removed/foo.bin" inDirectory:sourceDirectory];
+        [self writeData:[NSData dataWithBytes:"child" length:5] toPath:@"kept/foo.bin/child" inDirectory:sourceDirectory];
+        [self writeData:dataWithEdits(original, 4096) toPath:@"kept/foo.bin" inDirectory:destinationDirectory];
+    }];
+}
+
+- (void)testLargeFileDiff
+{
+    NSData *original = deterministicData(2u << 20, 7);
+    NSMutableData *shifted = [dataWithEdits(original, 65536) mutableCopy];
+    [shifted replaceBytesInRange:NSMakeRange(1000000, 0) withBytes:"inserted" length:8];
+    uint64_t size = [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:original toPath:@"A" inDirectory:sourceDirectory];
+        [self writeData:shifted toPath:@"A" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(size, 65536u);
+}
+
+- (void)testFileSizesAroundLargeFileThreshold
+{
+    NSData *original = deterministicData((1u << 20) + 1, 8);
+    for (NSUInteger length = (1u << 20) - 1; length <= (1u << 20) + 1; length++) {
+        NSData *old = [original subdataWithRange:NSMakeRange(0, length)];
+        [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+            [self writeData:old toPath:@"A" inDirectory:sourceDirectory];
+            [self writeData:dataWithEdits(old, 100000) toPath:@"A" inDirectory:destinationDirectory];
+        }];
+    }
+}
+
+// These inputs are quadratic without bsdiff's work budgets, taking minutes or more
+- (void)assertDeltaIsQuickForOld:(NSData *)old new:(NSData *)new
+{
+    NSDate *start = [NSDate date];
+    [self deltaSizeWithHandler:^(NSFileManager *__unused fileManager, NSString *sourceDirectory, NSString *destinationDirectory) {
+        [self writeData:old toPath:@"A" inDirectory:sourceDirectory];
+        [self writeData:new toPath:@"A" inDirectory:destinationDirectory];
+    }];
+    XCTAssertLessThan(-start.timeIntervalSinceNow, 30.0);
+}
+
+- (void)testRepetitiveDataBelowLargeFileThreshold
+{
+    [self assertDeltaIsQuickForOld:repeatingData((1u << 20) - 8, 8) new:dataWithEdits(repeatingData(8u << 20, 8), 256)];
+}
+
+- (void)testRepetitiveDataAboveLargeFileThreshold
+{
+    NSMutableData *new = [repeatingData(4u << 20, 2) mutableCopy];
+    [new replaceBytesInRange:NSMakeRange(2u << 20, 0) withBytes:"zz" length:2];
+    [self assertDeltaIsQuickForOld:repeatingData(8u << 20, 2) new:new];
+}
+
+- (void)testShortPeriodDataBelowLargeFileThreshold
+{
+    NSMutableData *new = [repeatingData(4u << 20, 2) mutableCopy];
+    [new replaceBytesInRange:NSMakeRange(2u << 20, 0) withBytes:"zz" length:2];
+    [self assertDeltaIsQuickForOld:repeatingData((1u << 20) - 8, 2) new:new];
+}
+
+- (void)testUnalignedZeroRun
+{
+    NSMutableData *old = [deterministicData((1u << 20) + 1, 13) mutableCopy];
+    [old increaseLengthBy:8u << 20];
+    NSMutableData *new = [NSMutableData dataWithLength:(4u << 20) + 1];
+    [new appendData:deterministicData(4096, 14)];
+    [new increaseLengthBy:4u << 20];
+    [self assertDeltaIsQuickForOld:old new:new];
+}
+
+- (void)testNearDuplicateBlocks
+{
+    NSUInteger length = 1u << 19;
+    NSData *block = deterministicData(length, 9);
+    NSData *firstPadding = deterministicData(length, 10);
+    NSData *secondPadding = deterministicData(length, 11);
+    NSMutableData *nearBlock = [block mutableCopy];
+    ((uint8_t *)nearBlock.mutableBytes)[length - 1] ^= 1;
+
+    NSMutableData *old = [block mutableCopy];
+    [old appendData:firstPadding];
+    [old appendBytes:"\xAA\xAA" length:2];
+    [old appendData:nearBlock];
+    [old appendData:secondPadding];
+
+    NSMutableData *new = [firstPadding mutableCopy];
+    [new appendBytes:"\x55\x55" length:2];
+    [new appendData:block];
+    [new appendData:secondPadding];
+
+    [self assertDeltaIsQuickForOld:old new:new];
+}
+
 @end

@@ -272,7 +272,8 @@ static BOOL shouldChangePermissions(NSDictionary *originalInfo, NSDictionary *ne
 }
 
 #define MIN_SIZE_FOR_CLONE 4096
-#define MIN_SIZE_FOR_CLONE_DIFF 4096
+#define MIN_SIZE_FOR_SKETCH (4096 * 4)
+#define MIN_SIMILAR_SIZE_RATIO 0.60
 
 static NSString *hashedNameStem(NSString *key)
 {
@@ -286,16 +287,34 @@ static NSString *hashedNameStem(NSString *key)
 
 // Content-defined sampling: both sides keep the same 8-grams wherever they sit in the file, so renames and shifts don't matter.
 #define SKETCH_MIN_VOTES 4
+#define SKETCH_MAX_CAPACITY (1ull << 24)
+#define SKETCH_MAX_PROBES 32
+
+// A bounded probe, so that crafted or repetitive data can't make the table slow. Returns NO if there's no slot for the sample.
+static BOOL findSketchSlot(const uint64_t *table, uint64_t mask, uint64_t sample, uint64_t *outSlot)
+{
+    uint64_t slot = ((sample ^ (sample >> 32)) * 0xFF51AFD7ED558CCDull >> 20) & mask;
+    for (int probe = 0; probe < SKETCH_MAX_PROBES; probe++) {
+        if (table[slot] == 0 || table[slot] == sample) {
+            *outSlot = slot;
+            return YES;
+        }
+        slot = (slot + 1) & mask;
+    }
+    return NO;
+}
 static void forEachSketchSample(NSString *path, void (^body)(uint64_t sample))
 {
-    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedAlways error:NULL];
-    const uint8_t *bytes = data.bytes;
-    for (NSUInteger i = 0; i + 8 <= data.length; i++) {
-        uint64_t value;
-        memcpy(&value, bytes + i, 8);
-        uint64_t hash = value * 0x9E3779B97F4A7C15ull;
-        if ((hash >> 58) == 0) {
-            body(hash | 1);
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedAlways error:NULL];
+        const uint8_t *bytes = data.bytes;
+        for (NSUInteger i = 0; i + 8 <= data.length; i++) {
+            uint64_t value;
+            memcpy(&value, bytes + i, 8);
+            uint64_t hash = value * 0x9E3779B97F4A7C15ull;
+            if ((hash >> 58) == 0) {
+                body(hash | 1);
+            }
         }
     }
 }
@@ -316,18 +335,24 @@ static void addSketchSubstitutes(NSArray<NSString *> *keys, NSDictionary *newTre
         return;
     }
     uint64_t capacity = 1024;
-    while (capacity < removedBytes / 16) {
+    while (capacity < removedBytes / 16 && capacity < SKETCH_MAX_CAPACITY) {
         capacity <<= 1;
     }
     uint64_t mask = capacity - 1;
     uint64_t *table = calloc(capacity, sizeof(uint64_t));
     uint32_t *owner = calloc(capacity, sizeof(uint32_t));
     uint32_t *votes = calloc(removed.count, sizeof(uint32_t));
+    if (table == NULL || owner == NULL || votes == NULL) {
+        free(table);
+        free(owner);
+        free(votes);
+        return;
+    }
     for (uint32_t index = 0; index < removed.count; index++) {
         forEachSketchSample(originalTreeState[removed[index]][INFO_PATH_KEY], ^(uint64_t sample) {
-            uint64_t slot = (sample >> 7) & mask;
-            while (table[slot] != 0 && table[slot] != sample) {
-                slot = (slot + 1) & mask;
+            uint64_t slot;
+            if (!findSketchSlot(table, mask, sample, &slot)) {
+                return;
             }
             table[slot] = sample;
             owner[slot] = index;
@@ -335,11 +360,11 @@ static void addSketchSubstitutes(NSArray<NSString *> *keys, NSDictionary *newTre
     }
     for (NSString *key in keys) {
         id value = [newTreeState valueForKey:key];
-        if ([(NSObject *)value isEqual:[NSNull null]] || originalTreeState[key] != nil || fileSubstitutes[key.lastPathComponent] != nil) {
+        if ([(NSObject *)value isEqual:[NSNull null]] || originalTreeState[key] != nil || fileSubstitutes[key] != nil) {
             continue;
         }
         NSDictionary *newInfo = value;
-        if ([(NSNumber *)newInfo[INFO_TYPE_KEY] unsignedShortValue] != FTS_F) {
+        if ([(NSNumber *)newInfo[INFO_TYPE_KEY] unsignedShortValue] != FTS_F || [(NSNumber *)newInfo[INFO_SIZE_KEY] unsignedLongLongValue] <= MIN_SIZE_FOR_SKETCH) {
             continue;
         }
         memset(votes, 0, removed.count * sizeof(uint32_t));
@@ -348,17 +373,14 @@ static void addSketchSubstitutes(NSArray<NSString *> *keys, NSDictionary *newTre
         __block uint32_t total = 0;
         forEachSketchSample(newInfo[INFO_PATH_KEY], ^(uint64_t sample) {
             total++;
-            uint64_t slot = (sample >> 7) & mask;
-            while (table[slot] != 0 && table[slot] != sample) {
-                slot = (slot + 1) & mask;
-            }
-            if (table[slot] == sample && ++votes[owner[slot]] > bestVotes) {
+            uint64_t slot;
+            if (findSketchSlot(table, mask, sample, &slot) && table[slot] == sample && ++votes[owner[slot]] > bestVotes) {
                 bestVotes = votes[owner[slot]];
                 best = owner[slot];
             }
         });
-        if (bestVotes >= SKETCH_MIN_VOTES && bestVotes * 5 >= total) {
-            fileSubstitutes[key.lastPathComponent] = removed[best];
+        if (bestVotes >= SKETCH_MIN_VOTES && (uint64_t)bestVotes * 5 >= total) {
+            fileSubstitutes[key] = removed[best];
         }
     }
     free(table);
@@ -416,12 +438,12 @@ static NSString *cloneableRelativePath(NSDictionary<NSString *, NSData *> *after
         }
     }
     
-    // For non-identical files where we do a binary diff, make sure file size matches a more strict file size test
-    if ([(NSNumber *)newInfo[INFO_SIZE_KEY] unsignedLongLongValue] <= MIN_SIZE_FOR_CLONE_DIFF) {
+    // A binary diff item can't delete what's at this path, so it can't replace a directory with a file
+    if (originalTreeState[key] != nil) {
         return nil;
     }
-    
-    // Look out for any .framework/Versions/{A -> B} changes
+
+// Look out for any .framework/Versions/{A -> B} changes
     for (NSString *frameworkVersionPrefix in frameworkVersionsSubstitutes) {
         if (![key hasPrefix:frameworkVersionPrefix]) {
             continue;
@@ -462,7 +484,7 @@ static NSString *cloneableRelativePath(NSDictionary<NSString *, NSData *> *after
     
     // Look out for any changes that involve the same named file moving to another directory
     do {
-        NSString *cloneRelativeKey = fileSubstitutes[key.lastPathComponent];
+        NSString *cloneRelativeKey = fileSubstitutes[key] ?: fileSubstitutes[key.lastPathComponent];
         if (cloneRelativeKey == nil) {
             break;
         }
@@ -478,7 +500,7 @@ static NSString *cloneableRelativePath(NSDictionary<NSString *, NSData *> *after
         uint64_t maxSize = MAX(cloneSize, newSize);
         
         // Ensure file is at least 60% the same size
-        if (minSize == 0 || maxSize == 0 || (double)minSize / (double)maxSize < 0.60) {
+        if (minSize == 0 || maxSize == 0 || (double)minSize / (double)maxSize < MIN_SIMILAR_SIZE_RATIO) {
             break;
         }
         
@@ -958,28 +980,34 @@ BOOL createBinaryDelta(NSString *source, NSString *destination, NSString *patchF
         // Heuristic #3: bundlers name output <stem>-<content hash>.<ext>, so a changed chunk looks like a remove and an add.
         // Alias each added file to the removed file with the same directory, stem and extension.
         NSMutableDictionary<NSString *, NSString *> *removedByStem = [NSMutableDictionary dictionary];
+        NSMutableSet<NSString *> *ambiguousStems = [NSMutableSet set];
         for (NSString *key in keys) {
             if (![(NSObject *)[newTreeState valueForKey:key] isEqual:[NSNull null]]) {
                 continue;
             }
-            NSDictionary *keyInfo = originalTreeState[key];
             NSString *stem = hashedNameStem(key);
-            if (stem == nil || [(NSNumber *)keyInfo[INFO_TYPE_KEY] unsignedShortValue] != FTS_F) {
+            if (stem == nil || [(NSNumber *)originalTreeState[key][INFO_TYPE_KEY] unsignedShortValue] != FTS_F) {
                 continue;
             }
-            NSString *existingKey = removedByStem[stem];
-            if (existingKey == nil || [(NSNumber *)keyInfo[INFO_SIZE_KEY] unsignedLongValue] > [(NSNumber *)originalTreeState[existingKey][INFO_SIZE_KEY] unsignedLongValue]) {
-                removedByStem[stem] = key;
+            if (removedByStem[stem] != nil) {
+                [ambiguousStems addObject:stem];
             }
+            removedByStem[stem] = key;
         }
         for (NSString *key in keys) {
-            if ([(NSObject *)[newTreeState valueForKey:key] isEqual:[NSNull null]] || originalTreeState[key] != nil) {
+            id value = [newTreeState valueForKey:key];
+            if ([(NSObject *)value isEqual:[NSNull null]] || originalTreeState[key] != nil) {
                 continue;
             }
             NSString *stem = hashedNameStem(key);
-            NSString *removedKey = stem != nil ? removedByStem[stem] : nil;
-            if (removedKey != nil && fileSubstitutes[key.lastPathComponent] == nil) {
-                fileSubstitutes[key.lastPathComponent] = removedKey;
+            NSString *removedKey = (stem != nil && ![ambiguousStems containsObject:stem]) ? removedByStem[stem] : nil;
+            if (removedKey == nil) {
+                continue;
+            }
+            uint64_t removedSize = [(NSNumber *)originalTreeState[removedKey][INFO_SIZE_KEY] unsignedLongLongValue];
+            uint64_t addedSize = [(NSNumber *)((NSDictionary *)value)[INFO_SIZE_KEY] unsignedLongLongValue];
+            if ((double)MIN(removedSize, addedSize) >= (double)MAX(removedSize, addedSize) * MIN_SIMILAR_SIZE_RATIO) {
+                fileSubstitutes[key] = removedKey;
             }
         }
 

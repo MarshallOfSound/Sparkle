@@ -51,6 +51,15 @@ __FBSDID("$FreeBSD: src/usr.bin/bsdiff/bsdiff/bsdiff.c, v 1.1 2005/08/06 01:59:0
 #define HASH_WAYS 8
 #define HASH_KEY_MASK 0xFFFFFFFFFFFFull /* 6 bytes */
 #define HASH_READ_SIZE 8
+/* Bounds match checking per scanned byte, so repetitive data stays linear
+ * whichever index found the matches. */
+#define SEARCH_WORK_PER_BYTE 16
+#define SEARCH_WORK_SLACK (1 << 16)
+/* Extending matches is normally cheap. Past this budget, repetitive data has
+ * made it dominate, so each extension's reach is capped. */
+#define EXTEND_WORK_PER_BYTE 64
+#define EXTEND_WORK_SLACK (1 << 26)
+#define EXTEND_CAPPED_REACH 4096
 
 typedef struct {
     uint32_t *slots;
@@ -122,10 +131,16 @@ static int hash_build(hash_index *h, const u_char *old, off_t oldsize)
     if ((h->slots = big_alloc(hash_bytes(h))) == NULL)
         return -1;
 
-    for (off_t i = 0; i + HASH_READ_SIZE <= oldsize; i += HASH_STRIDE) {
+    /* Positions are stored as 32-bit values, offset by one so 0 means empty. */
+    for (off_t i = 0; i + HASH_READ_SIZE <= oldsize && i < UINT32_MAX; i += HASH_STRIDE) {
         uint32_t *bucket = hash_bucket(h, hash_key(old + i));
-        memmove(bucket + 1, bucket, (HASH_WAYS - 1) * sizeof(uint32_t));
-        bucket[0] = (uint32_t)i + 1;
+        /* Keep the earliest positions: in repetitive data, later ones hit the end of the file and give short matches. */
+        for (unsigned w = 0; w < HASH_WAYS; w++) {
+            if (bucket[w] == 0) {
+                bucket[w] = (uint32_t)i + 1;
+                break;
+            }
+        }
     }
     return 0;
 }
@@ -252,6 +267,8 @@ int bsdiff(int argc, char *argv[])
     size_t Ibytes = 0;              /* size of I */
     hash_index H = {0};             /* sampled index of old, for large files */
     int usehash = 0;
+    off_t prev_len = 0, prev_oldscore = 0, prev_pos = 0;
+    off_t extendwork = 0, reach = 0;
     off_t mappednewsize = 0;        /* newsize is reused as scratch below */
     off_t scan = 0;                 /* position of current match in old file */
     off_t pos = 0;              /* position of current match in new file */
@@ -296,7 +313,10 @@ int bsdiff(int argc, char *argv[])
 
         /* Do a suffix sort on the old file. */
         I[0] = (int)oldsize;
-        sais(old, I+1, (int)oldsize);
+        if (sais(old, I+1, (int)oldsize) != 0) {
+            warn("Failed to sort %s", argv[1]);
+            goto cleanup;
+        }
     }
 
     newp = map_file(argv[2], &newsize);
@@ -354,11 +374,15 @@ int bsdiff(int argc, char *argv[])
          * go past that block of data. We need to track the number of
          * times we're stuck in the block and break out of it. */
         int num_less_than_eight = 0;
-        off_t prev_len, prev_oldscore, prev_pos;
+        off_t searchwork = 0, searchstart = scan + len;
         for (scsc = scan += len; scan < newsize; scan++) {
-            prev_len = len;
-            prev_oldscore = oldscore;
-            prev_pos = pos;
+            /* A sampled index misses at positions with no entry, reporting len 0
+             * with a stale pos. Misses must not disturb the stuck-block guard. */
+            if (!usehash || len != 0) {
+                prev_len = len;
+                prev_oldscore = oldscore;
+                prev_pos = pos;
+            }
             /* 'oldscore' is the number of characters that match between the
              * substrings 'old[lastoffset + scan:lastoffset + scsc]' and
              * 'new[scan:scsc]'. */
@@ -381,8 +405,11 @@ int bsdiff(int argc, char *argv[])
             /* Choose this as our match if it contains more than eight
              * characters that would be wrong if matched with a forward
              * extension of the previous match instead. */
-            if (((len == oldscore) && (len != 0)) || 
-                (len > oldscore + 8))
+            if ((len != 0) && ((len == oldscore) || (len > oldscore + 8)))
+                break;
+
+            searchwork += len;
+            if (searchwork > (scan - searchstart) * SEARCH_WORK_PER_BYTE + SEARCH_WORK_SLACK)
                 break;
 
             /* Since we're advancing 'scan' by 1, remove the character under it
@@ -394,6 +421,8 @@ int bsdiff(int argc, char *argv[])
             /* Modification ported from ChromiumOS project:
              * https://chromium.googlesource.com/chromiumos/third_party/bsdiff/+/426e4aa1cbeb3c8a73002047d7a796ca8e5e17d4%5E%21/#F0 */
             const off_t fuzz = 8;
+            if (usehash && len == 0)
+                continue;
             if (prev_len - fuzz <= len && len <= prev_len &&
                 prev_oldscore - fuzz <= oldscore &&
                 oldscore <= prev_oldscore &&
@@ -413,7 +442,11 @@ int bsdiff(int argc, char *argv[])
             s = 0;
             Sf = 0;
             lenf = 0;
-            for (i = 0; (lastscan + i < scan) && (lastpos + i < oldsize);) {
+            reach = scan - lastscan;
+            if (extendwork > newsize * EXTEND_WORK_PER_BYTE + EXTEND_WORK_SLACK)
+                reach = MIN(reach, EXTEND_CAPPED_REACH);
+            extendwork += reach;
+            for (i = 0; (i < reach) && (lastpos + i < oldsize);) {
                 if (old[lastpos + i] == newp[lastscan + i])
                     s++;
                 i++;
@@ -428,7 +461,7 @@ int bsdiff(int argc, char *argv[])
             if (scan < newsize) {
                 s = 0;
                 Sb = 0;
-                for (i = 1; (scan >= lastscan + i) && (pos >= i); i++) {
+                for (i = 1; (i <= reach) && (pos >= i); i++) {
                     if (old[pos - i] == newp[scan - i])
                         s++;
                     if (s * 2 - i > Sb * 2 - lenb) {
